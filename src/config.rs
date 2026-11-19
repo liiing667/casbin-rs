@@ -32,8 +32,9 @@ fn remove_inline_comment(line: &str) -> String {
             Some(body) => (body, true),
             None => (line, false),
         };
-    let body = match body.find(|c| {
-        DEFAULT_COMMENT.contains(c) || DEFAULT_COMMENT_SEM.contains(c)
+    let body = match crate::util::find_outside_strings(body, |b| {
+        DEFAULT_COMMENT.contains(b as char)
+            || DEFAULT_COMMENT_SEM.contains(b as char)
     }) {
         Some(idx) => &body[..idx],
         None => body,
@@ -369,6 +370,41 @@ mod tests {
         assert_eq!(
             Some("test key".to_owned()),
             config.get_string("other::key1")
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_inline_comment_respects_strings() {
+        let text: &str = r##"
+            [matchers]
+            m = !(r.sub == "mallory#admin") && r.obj == p.obj # real comment
+            m2 = r.sub == 'a;b' && r.act == p.act ; real comment
+            m3 = r.sub == "a\"#b" && r.act == p.act
+        "##;
+
+        let config = Config::from_str(text).await.unwrap();
+
+        assert_eq!(
+            Some(
+                r##"!(r.sub == "mallory#admin") && r.obj == p.obj"##.to_owned()
+            ),
+            config.get_string("matchers::m")
+        );
+        assert_eq!(
+            Some("r.sub == 'a;b' && r.act == p.act".to_owned()),
+            config.get_string("matchers::m2")
+        );
+        assert_eq!(
+            Some(r##"r.sub == "a\"#b" && r.act == p.act"##.to_owned()),
+            config.get_string("matchers::m3")
         );
     }
 }

@@ -2283,4 +2283,189 @@ m = r.sub == p.sub && r.act == p.act && isOwner(r.sub, r.obj)
             .insert(("alice".to_owned(), "doc2".to_owned()));
         assert!(e.enforce(("alice", "doc2", "read")).unwrap());
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_matcher_comment_inside_string_keeps_deny_guard() {
+        // The `#` inside the string literal is part of the compared value,
+        // not a comment: the deny guard after it must stay intact.
+        let m = DefaultModel::from_str(
+            r##"
+            [request_definition]
+            r = sub, obj, act
+
+            [policy_definition]
+            p = obj, act
+
+            [policy_effect]
+            e = some(where (p.eft == allow))
+
+            [matchers]
+            m = (r.obj == p.obj && r.act == p.act) && !(r.sub == "mallory#admin" || r.sub == "mallory")
+        "##,
+        )
+        .await
+        .unwrap();
+
+        let mut e = Enforcer::new(m, MemoryAdapter::default()).await.unwrap();
+        e.add_policy(vec!["data1".to_owned(), "read".to_owned()])
+            .await
+            .unwrap();
+
+        assert!(e.enforce(("alice", "data1", "read")).unwrap());
+        assert!(!e.enforce(("mallory", "data1", "read")).unwrap());
+        assert!(!e.enforce(("mallory#admin", "data1", "read")).unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_matcher_in_operator_inside_string_not_rewritten() {
+        // `in (...)` inside a string literal is data, not the set operator.
+        let m = DefaultModel::from_str(
+            r#"
+            [request_definition]
+            r = sub, obj, act
+
+            [policy_definition]
+            p = obj, act
+
+            [policy_effect]
+            e = some(where (p.eft == allow))
+
+            [matchers]
+            m = r.sub == "drop in (prod)" || (r.obj == p.obj && r.act == p.act)
+        "#,
+        )
+        .await
+        .unwrap();
+
+        let mut e = Enforcer::new(m, MemoryAdapter::default()).await.unwrap();
+        e.add_policy(vec!["data1".to_owned(), "read".to_owned()])
+            .await
+            .unwrap();
+
+        assert!(e.enforce(("drop in (prod)", "data9", "read")).unwrap());
+        assert!(e.enforce(("alice", "data1", "read")).unwrap());
+        assert!(!e.enforce(("alice", "data9", "read")).unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_matcher_in_operator_and_eval_still_work() {
+        let m = DefaultModel::from_str(
+            r#"
+            [request_definition]
+            r = sub, obj, act
+
+            [policy_definition]
+            p = sub_rule, obj, act
+
+            [policy_effect]
+            e = some(where (p.eft == allow))
+
+            [matchers]
+            m = eval(p.sub_rule) && r.obj == p.obj && r.act in ("read", "write")
+        "#,
+        )
+        .await
+        .unwrap();
+
+        let mut e = Enforcer::new(m, MemoryAdapter::default()).await.unwrap();
+        e.add_policy(vec![
+            r#"r.sub == "alice""#.to_owned(),
+            "data1".to_owned(),
+            "read".to_owned(),
+        ])
+        .await
+        .unwrap();
+
+        // eval() runs the policy-provided rule and the `in` set gates the
+        // action: both legacy expression kinds must keep working.
+        assert!(e.enforce(("alice", "data1", "read")).unwrap());
+        assert!(!e.enforce(("bob", "data1", "read")).unwrap());
+        assert!(!e.enforce(("alice", "data1", "delete")).unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_malformed_matcher_fails_closed_with_position() {
+        // Unterminated string: model loading must fail and the error must
+        // point at the matcher with a position, never silently allow.
+        let m = DefaultModel::from_str(
+            r#"
+            [request_definition]
+            r = sub, obj, act
+
+            [policy_definition]
+            p = obj, act
+
+            [policy_effect]
+            e = some(where (p.eft == allow))
+
+            [matchers]
+            m = r.sub == "alice && r.obj == p.obj
+        "#,
+        )
+        .await
+        .unwrap();
+
+        let err = match Enforcer::new(m, MemoryAdapter::default()).await {
+            Ok(_) => panic!("malformed matcher must not load"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("m") && err.contains('('),
+            "error should name the matcher and carry a position: {}",
+            err
+        );
+
+        // Unbalanced parens in an `in` set must also fail closed.
+        let m = DefaultModel::from_str(
+            r#"
+            [request_definition]
+            r = sub, obj, act
+
+            [policy_definition]
+            p = obj, act
+
+            [policy_effect]
+            e = some(where (p.eft == allow))
+
+            [matchers]
+            m = r.sub in ("alice", "bob" && r.obj == p.obj
+        "#,
+        )
+        .await
+        .unwrap();
+
+        assert!(Enforcer::new(m, MemoryAdapter::default()).await.is_err());
+    }
 }
