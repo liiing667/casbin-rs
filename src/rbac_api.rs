@@ -1159,6 +1159,89 @@ mod tests {
         all(feature = "runtime-tokio", not(target_arch = "wasm32")),
         tokio::test
     )]
+    async fn test_wildcard_domains_keep_tenant_views_isolated() {
+        let mut model = DefaultModel::default();
+        model.add_def("r", "r", "sub, dom, obj, act");
+        model.add_def("p", "p", "sub, dom, obj, act");
+        model.add_def("g", "g", "_, _, _");
+        model.add_def("e", "e", "some(where (p.eft == allow))");
+        model.add_def(
+            "m",
+            "m",
+            "g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj \
+             && r.act == p.act",
+        );
+
+        let mut enforcer = Enforcer::new(model, MemoryAdapter::default())
+            .await
+            .unwrap();
+        enforcer
+            .get_role_manager()
+            .write()
+            .matching_fn(None, Some(crate::model::key_match));
+
+        // Shared wildcard role hierarchy and per-tenant grants.
+        enforcer
+            .add_role_for_user("viewer", "admin", Some("*"))
+            .await
+            .unwrap();
+        enforcer
+            .add_role_for_user("eve", "admin", Some("tenantA"))
+            .await
+            .unwrap();
+        enforcer
+            .add_role_for_user("bob", "viewer", Some("tenantB"))
+            .await
+            .unwrap();
+
+        // The same role query from the two tenants must show the boundary.
+        assert_eq!(
+            vec!["admin".to_owned()],
+            sort_unstable(enforcer.get_roles_for_user("eve", Some("tenantA")))
+        );
+        assert!(enforcer
+            .get_roles_for_user("eve", Some("tenantB"))
+            .is_empty());
+
+        // Bob inherits the approved shared hierarchy only inside tenant B.
+        assert_eq!(
+            vec!["admin".to_owned(), "viewer".to_owned()],
+            sort_unstable(
+                enforcer.get_implicit_roles_for_user("bob", Some("tenantB"))
+            )
+        );
+        assert!(enforcer
+            .get_implicit_roles_for_user("bob", Some("tenantA"))
+            .is_empty());
+
+        // Removing the shared grant is reflected in every tenant while the
+        // private tenant-A grant is retained.
+        enforcer
+            .delete_role_for_user("viewer", "admin", Some("*"))
+            .await
+            .unwrap();
+        assert_eq!(
+            vec!["viewer".to_owned()],
+            enforcer.get_roles_for_user("bob", Some("tenantB"))
+        );
+        assert_eq!(
+            vec!["admin".to_owned()],
+            enforcer.get_roles_for_user("eve", Some("tenantA"))
+        );
+        assert!(enforcer
+            .get_roles_for_user("eve", Some("tenantB"))
+            .is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
     async fn test_pattern_matching_basic_role() {
         let e = Enforcer::new(
             "examples/rbac_basic_role_model.conf",
