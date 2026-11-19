@@ -30,6 +30,12 @@ pub enum RequestError {
 pub enum PolicyError {
     #[error("Policy doesn't match policy definition. expected length: {0}, found length {1}")]
     UnmatchPolicyDefinition(usize, usize),
+    #[error(
+        "Invalid subject hierarchy for subjectPriority: {0}. \
+         Role hierarchies must stay inside a single domain and be acyclic \
+         (every role must be reachable from a root role)"
+    )]
+    InvalidSubjectHierarchy(String),
 }
 
 /// RBAC error represents any type of errors in RBAC role manager

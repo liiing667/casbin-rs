@@ -54,39 +54,135 @@ def_package! {
 static CASBIN_PACKAGE: Lazy<CasbinPackage> = Lazy::new(CasbinPackage::new);
 
 use std::{
-    cmp::{max, Reverse},
-    collections::{HashMap, HashSet, VecDeque},
+    cmp::max,
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
 
+/// A subject in the role hierarchy, uniquely identified by its domain and
+/// role name. The empty domain represents domainless (`g = _, _`) roles.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+struct Subject {
+    domain: String,
+    name: String,
+}
+
+/// Builds the subject hierarchy used by the
+/// `subjectPriority(p_eft) || deny` policy effect.
+///
+/// The returned map assigns every subject a deterministic level measured in
+/// edges from a root role (a role that is nobody's child). Subjects further
+/// from the root receive higher levels and therefore higher policy priority.
+///
+/// The hierarchy has to be well formed before any authorization decision is
+/// made, otherwise enforcement cannot establish a trustworthy priority order:
+///
+/// * every grouping rule must stay inside a single domain, so a role can
+///   never inherit from a role that belongs to another domain;
+/// * the directed graph must be acyclic and every node must be reachable from
+///   a root, so cycles and rootless fragments make the ordering fail closed
+///   with an error instead of silently producing arbitrary priorities.
+///
+/// All graph bookkeeping uses ordered collections, hence the resulting levels
+/// depend only on the policy content and never on insertion order or hash
+/// traversal.
 fn subject_hierarchy(
     policies: &LinkedHashSet<Vec<String>>,
-) -> HashMap<(String, String), usize> {
-    let mut children: HashMap<(String, String), Vec<(String, String)>> =
-        HashMap::new();
-    let mut parents = Vec::new();
-    for rule in policies.iter().filter(|rule| rule.len() >= 2) {
-        let domain = rule.get(2).cloned().unwrap_or_default();
-        let child = (domain.clone(), rule[0].clone());
-        let parent = (domain, rule[1].clone());
-        parents.push(parent.clone());
-        children.entry(parent).or_default().push(child);
-    }
+) -> Result<HashMap<Subject, usize>> {
+    let mut children: BTreeMap<Subject, BTreeSet<Subject>> = BTreeMap::new();
+    let mut indegree: BTreeMap<Subject, usize> = BTreeMap::new();
 
-    let nested: HashSet<_> = children.values().flatten().collect();
-    let mut levels = HashMap::new();
-    for root in parents.iter().filter(|x| !nested.contains(x)) {
-        let mut queue = VecDeque::from([(root, 0)]);
-        while let Some((node, level)) = queue.pop_front() {
-            if let Some(nodes) =
-                children.get(node).filter(|_| level < policies.len())
-            {
-                queue.extend(nodes.iter().map(|x| (x, level + 1)));
-            }
-            levels.insert(node.clone(), level);
+    for rule in policies.iter().filter(|rule| rule.len() >= 2) {
+        let child_domain = rule.get(2).cloned().unwrap_or_default();
+        let parent_domain =
+            rule.get(3).cloned().unwrap_or_else(|| child_domain.clone());
+        let child = Subject {
+            domain: child_domain.clone(),
+            name: rule[0].clone(),
+        };
+        let parent = Subject {
+            domain: parent_domain,
+            name: rule[1].clone(),
+        };
+
+        if parent.domain != child.domain {
+            return Err(PolicyError::InvalidSubjectHierarchy(format!(
+                "role `{}` in domain `{}` cannot inherit from role `{}` in \
+                 different domain `{}`",
+                child.name, child.domain, parent.name, parent.domain
+            ))
+            .into());
+        }
+
+        indegree.entry(child.clone()).or_insert(0);
+        indegree.entry(parent.clone()).or_insert(0);
+        if children
+            .entry(parent.clone())
+            .or_default()
+            .insert(child.clone())
+        {
+            *indegree.get_mut(&child).unwrap() += 1;
         }
     }
-    levels
+
+    let mut levels = HashMap::new();
+
+    // Kahn's algorithm: roots have no incoming edges. Processing subjects in
+    // `BTreeMap`/`BTreeSet` order makes every traversal deterministic.
+    let mut queue: VecDeque<(Subject, usize)> = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(subject, _)| (subject.clone(), 0))
+        .collect();
+
+    let mut visited = 0;
+    while let Some((node, level)) = queue.pop_front() {
+        visited += 1;
+        levels.insert(node.clone(), level);
+        if let Some(nodes) = children.get(&node) {
+            for child in nodes {
+                let degree = indegree.get_mut(child).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    queue.push_back((child.clone(), level + 1));
+                }
+            }
+        }
+    }
+
+    if visited != indegree.len() {
+        let description = indegree
+            .iter()
+            .filter(|(_, degree)| **degree > 0)
+            .map(|(subject, _)| subject)
+            .next()
+            .map(|subject| {
+                format!(
+                    "cycle or rootless role chain detected around `{}` (domain `{}`)",
+                    subject.name, subject.domain
+                )
+            })
+            .unwrap_or_else(|| "cycle or rootless role chain detected".to_owned());
+        return Err(PolicyError::InvalidSubjectHierarchy(description).into());
+    }
+
+    debug_assert_eq!(levels.len(), indegree.len());
+    Ok(levels)
+}
+
+#[inline]
+fn hierarchy_level(
+    hierarchy: &HashMap<Subject, usize>,
+    domain: &str,
+    name: &str,
+) -> usize {
+    hierarchy
+        .get(&Subject {
+            domain: domain.to_owned(),
+            name: name.to_owned(),
+        })
+        .copied()
+        .unwrap_or(0)
 }
 
 type EventCallback = fn(&mut Enforcer, EventData);
@@ -528,14 +624,15 @@ impl Enforcer {
         });
     }
 
-    fn sort_policies(&mut self) {
+    fn sort_policies(&mut self) -> Result<()> {
         let model = self.model.get_mut_model();
         let hierarchy = model
             .get("e")
             .and_then(|asts| asts.get("e"))
             .filter(|ast| ast.value == "subjectPriority(p_eft) || deny")
             .and_then(|_| model.get("g").and_then(|asts| asts.get("g")))
-            .map(|ast| subject_hierarchy(&ast.policy));
+            .map(|ast| subject_hierarchy(&ast.policy))
+            .transpose()?;
 
         if let Some(asts) = model.get_mut("p") {
             for (ptype, ast) in asts.iter_mut() {
@@ -551,30 +648,58 @@ impl Enforcer {
                     continue;
                 }
 
+                // Compute every ordering key before draining the policy set so
+                // an invalid hierarchy leaves the loaded policy untouched.
+                let hierarchy = &hierarchy;
                 let mut policies: Vec<Vec<String>> =
                     ast.policy.drain().collect();
-                if let Some(hierarchy) = &hierarchy {
-                    policies.sort_by_key(|rule| {
+                policies.sort_by(|left, right| {
+                    // 1. Subject hierarchy level (deeper subjects win). The
+                    //    `(domain, name)` pair is part of the key, so roles in
+                    //    different domains never share an identity.
+                    let level = |rule: &Vec<String>| {
                         let domain = dom_index
                             .and_then(|i| rule.get(i))
                             .map_or("", String::as_str);
                         let name = rule.first().map_or("", String::as_str);
-                        Reverse(
-                            hierarchy
-                                .get(&(domain.to_owned(), name.to_owned()))
-                                .copied()
-                                .unwrap_or(0),
-                        )
-                    });
-                }
-                if let Some(i) = priority_index {
-                    policies.sort_by_key(|rule| {
-                        rule.get(i).and_then(|x| x.parse::<i64>().ok())
-                    });
-                }
+                        match hierarchy {
+                            Some(hierarchy) => {
+                                hierarchy_level(hierarchy, domain, name)
+                            }
+                            None => 0,
+                        }
+                    };
+                    let left_level = level(left);
+                    let right_level = level(right);
+                    if left_level != right_level {
+                        return right_level.cmp(&left_level);
+                    }
+
+                    // 2. Explicit `p_priority` column, lowest value first.
+                    if let Some(i) = priority_index {
+                        let priority = |rule: &Vec<String>| {
+                            rule.get(i).and_then(|x| x.parse::<i64>().ok())
+                        };
+                        match (priority(left), priority(right)) {
+                            (Some(left_priority), Some(right_priority))
+                                if left_priority != right_priority =>
+                            {
+                                return left_priority.cmp(&right_priority);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // 3. Fully qualified rule as the final tie breaker, making
+                    //    the total order independent of insertion order and
+                    //    hash-map traversal.
+                    left.cmp(right)
+                });
                 ast.policy = policies.into_iter().collect();
             }
         }
+
+        Ok(())
     }
 
     pub(crate) fn register_g_functions(&mut self) -> Result<()> {
@@ -954,7 +1079,7 @@ impl CoreApi for Enforcer {
     async fn load_policy(&mut self) -> Result<()> {
         self.model.clear_policy();
         self.adapter.load_policy(&mut *self.model).await?;
-        self.sort_policies();
+        self.sort_policies()?;
 
         if self.auto_build_role_links {
             self.build_role_links()?;
@@ -968,7 +1093,7 @@ impl CoreApi for Enforcer {
         self.adapter
             .load_filtered_policy(&mut *self.model, f)
             .await?;
-        self.sort_policies();
+        self.sort_policies()?;
 
         if self.auto_build_role_links {
             self.build_role_links()?;
@@ -2282,5 +2407,414 @@ m = r.sub == p.sub && r.act == p.act && isOwner(r.sub, r.obj)
             .unwrap()
             .insert(("alice".to_owned(), "doc2".to_owned()));
         assert!(e.enforce(("alice", "doc2", "read")).unwrap());
+    }
+
+    fn subject_priority_model(domains: bool) -> &'static str {
+        if domains {
+            r#"
+[request_definition]
+r = sub, dom, obj, act
+
+[policy_definition]
+p = sub, dom, obj, act, eft
+
+[role_definition]
+g = _, _, _
+
+[policy_effect]
+e = subjectPriority(p_eft) || deny
+
+[matchers]
+m = g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj && r.act == p.act
+"#
+        } else {
+            r#"
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act, eft
+
+[role_definition]
+g = _, _
+
+[policy_effect]
+e = subjectPriority(p_eft) || deny
+
+[matchers]
+m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
+"#
+        }
+    }
+
+    #[test]
+    fn subject_hierarchy_levels_are_depth_from_root() {
+        let policy: LinkedHashSet<Vec<String>> = [
+            vec!["alice".to_owned(), "team".to_owned()],
+            vec!["team".to_owned(), "org".to_owned()],
+            vec!["bob".to_owned(), "org".to_owned()],
+        ]
+        .into_iter()
+        .collect();
+
+        let levels = subject_hierarchy(&policy).unwrap();
+
+        assert_eq!(hierarchy_level(&levels, "", "org"), 0);
+        assert_eq!(hierarchy_level(&levels, "", "team"), 1);
+        assert_eq!(hierarchy_level(&levels, "", "alice"), 2);
+        assert_eq!(hierarchy_level(&levels, "", "bob"), 1);
+    }
+
+    #[test]
+    fn subject_hierarchy_keeps_domains_as_distinct_identities() {
+        let policy: LinkedHashSet<Vec<String>> = [
+            vec!["alice".to_owned(), "admin".to_owned(), "domain1".to_owned()],
+            vec!["bob".to_owned(), "admin".to_owned(), "domain2".to_owned()],
+        ]
+        .into_iter()
+        .collect();
+
+        let levels = subject_hierarchy(&policy).unwrap();
+
+        assert_eq!(hierarchy_level(&levels, "domain1", "admin"), 0);
+        assert_eq!(hierarchy_level(&levels, "domain2", "admin"), 0);
+        assert_eq!(hierarchy_level(&levels, "domain1", "alice"), 1);
+        assert_eq!(hierarchy_level(&levels, "domain2", "bob"), 1);
+    }
+
+    #[test]
+    fn subject_hierarchy_rejects_cycles() {
+        let policy: LinkedHashSet<Vec<String>> = [
+            vec!["a".to_owned(), "b".to_owned()],
+            vec!["b".to_owned(), "c".to_owned()],
+            vec!["c".to_owned(), "a".to_owned()],
+        ]
+        .into_iter()
+        .collect();
+
+        let err = subject_hierarchy(&policy).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::PolicyError(PolicyError::InvalidSubjectHierarchy(_))
+        ));
+    }
+
+    #[test]
+    fn subject_hierarchy_rejects_rootless_fragments() {
+        let policy: LinkedHashSet<Vec<String>> = [
+            vec!["root".to_owned(), "team".to_owned()],
+            vec!["x".to_owned(), "y".to_owned()],
+            vec!["y".to_owned(), "z".to_owned()],
+            vec!["z".to_owned(), "x".to_owned()],
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(matches!(
+            subject_hierarchy(&policy).unwrap_err(),
+            crate::Error::PolicyError(PolicyError::InvalidSubjectHierarchy(_))
+        ));
+    }
+
+    #[test]
+    fn subject_hierarchy_rejects_cross_domain_edges() {
+        let policy: LinkedHashSet<Vec<String>> = [
+            vec![
+                "alice".to_owned(),
+                "admin".to_owned(),
+                "domain1".to_owned(),
+                "domain1".to_owned(),
+            ],
+            vec![
+                "admin".to_owned(),
+                "superadmin".to_owned(),
+                "domain1".to_owned(),
+                "domain2".to_owned(),
+            ],
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(matches!(
+            subject_hierarchy(&policy).unwrap_err(),
+            crate::Error::PolicyError(PolicyError::InvalidSubjectHierarchy(_))
+        ));
+    }
+
+    #[test]
+    fn subject_hierarchy_is_stable_under_any_insertion_order() {
+        let rules = [
+            vec!["alice".to_owned(), "team".to_owned()],
+            vec!["team".to_owned(), "org".to_owned()],
+            vec!["bob".to_owned(), "team".to_owned()],
+            vec!["carol".to_owned(), "org".to_owned()],
+        ];
+
+        let baseline = subject_hierarchy(
+            &rules.iter().cloned().collect::<LinkedHashSet<_>>(),
+        )
+        .unwrap();
+
+        let mut shuffled = rules;
+        shuffled.reverse();
+        shuffled.swap(1, 2);
+        let reordered = subject_hierarchy(
+            &shuffled.iter().cloned().collect::<LinkedHashSet<_>>(),
+        )
+        .unwrap();
+
+        assert_eq!(baseline, reordered);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_subject_priority_multilevel_deny_overrides_allow() {
+        // `team` sits deeper than `org`, so its deny wins over org's allow.
+        let policy = r#"
+p, org, data1, read, allow
+p, team, data1, read, deny
+g, team, org
+g, alice, team
+"#;
+        let e = Enforcer::new(
+            DefaultModel::from_str(subject_priority_model(false))
+                .await
+                .unwrap(),
+            StringAdapter::new(policy),
+        )
+        .await
+        .unwrap();
+
+        assert!(!e.enforce(("alice", "data1", "read")).unwrap());
+
+        // A leaf-level allow still wins over an ancestor deny.
+        let policy = r#"
+p, org, data1, read, deny
+p, team, data1, read, allow
+g, team, org
+g, alice, team
+"#;
+        let e = Enforcer::new(
+            DefaultModel::from_str(subject_priority_model(false))
+                .await
+                .unwrap(),
+            StringAdapter::new(policy),
+        )
+        .await
+        .unwrap();
+
+        assert!(e.enforce(("alice", "data1", "read")).unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_subject_priority_order_is_independent_of_loading_order() {
+        // Both orders contain the same policy set. The deny rule belongs to
+        // the deeper subject and must win regardless of how the file is read.
+        let forward = r#"
+p, org, data1, read, allow
+p, team, data1, read, deny
+g, team, org
+g, alice, team
+"#;
+        let reverse = r#"
+g, alice, team
+g, team, org
+p, team, data1, read, deny
+p, org, data1, read, allow
+"#;
+
+        let build = |policy: &'static str| {
+            let model = subject_priority_model(false);
+            async move {
+                Enforcer::new(
+                    DefaultModel::from_str(model).await.unwrap(),
+                    StringAdapter::new(policy),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let e_forward = build(forward).await;
+        let e_reverse = build(reverse).await;
+
+        assert_eq!(
+            e_forward.get_policy(),
+            e_reverse.get_policy(),
+            "sorted policy order must not depend on insertion order"
+        );
+        assert!(!e_forward.enforce(("alice", "data1", "read")).unwrap());
+        assert!(!e_reverse.enforce(("alice", "data1", "read")).unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_subject_priority_isolates_domains() {
+        // The same role name is defined independently in two domains and the
+        // hierarchy must not leak levels across domain boundaries.
+        let policy = r#"
+p, admin, domain1, data1, read, allow
+p, admin, domain2, data1, read, deny
+g, alice, admin, domain1
+g, bob, admin, domain2
+"#;
+        let e = Enforcer::new(
+            DefaultModel::from_str(subject_priority_model(true))
+                .await
+                .unwrap(),
+            StringAdapter::new(policy),
+        )
+        .await
+        .unwrap();
+
+        assert!(e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+        assert!(!e.enforce(("bob", "domain2", "data1", "read")).unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_explicit_priority_column_is_order_independent() {
+        let model = r#"
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act, eft, p_priority
+
+[role_definition]
+g = _, _
+
+[policy_effect]
+e = subjectPriority(p_eft) || deny
+
+[matchers]
+m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
+"#;
+        // Both rules belong to the same subject, so hierarchy levels are
+        // equal and the explicit `p_priority` column breaks the tie. Under
+        // the existing ascending convention the lowest value is evaluated
+        // first, so the allow rule (value 1) must win regardless of how the
+        // rules were inserted.
+        let forward = r#"
+ p, root, data1, read, allow, 1
+p, root, data1, read, deny, 10
+g, alice, root
+"#;
+        let reverse = r#"
+p, root, data1, read, deny, 10
+p, root, data1, read, allow, 1
+g, alice, root
+"#;
+
+        let build = |policy: &'static str| async move {
+            Enforcer::new(
+                DefaultModel::from_str(model).await.unwrap(),
+                StringAdapter::new(policy),
+            )
+            .await
+            .unwrap()
+        };
+
+        let e_forward = build(forward).await;
+        let e_reverse = build(reverse).await;
+
+        assert_eq!(e_forward.get_policy(), e_reverse.get_policy());
+        assert!(e_forward.enforce(("alice", "data1", "read")).unwrap());
+        assert!(e_reverse.enforce(("alice", "data1", "read")).unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_subject_priority_fails_closed_on_cycle() {
+        let policy = r#"
+p, a, data1, read, allow
+p, b, data1, read, deny
+g, a, b
+g, b, a
+g, alice, a
+"#;
+
+        let result = Enforcer::new(
+            DefaultModel::from_str(subject_priority_model(false))
+                .await
+                .unwrap(),
+            StringAdapter::new(policy),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::PolicyError(
+                PolicyError::InvalidSubjectHierarchy(_)
+            ))
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_subject_priority_fails_closed_on_cross_domain_hierarchy() {
+        let policy = r#"
+p, admin, domain1, data1, read, allow
+g, alice, admin, domain1
+g, admin, superadmin, domain1, domain2
+"#;
+
+        let result = Enforcer::new(
+            DefaultModel::from_str(subject_priority_model(true))
+                .await
+                .unwrap(),
+            StringAdapter::new(policy),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::PolicyError(
+                PolicyError::InvalidSubjectHierarchy(_)
+            ))
+        ));
     }
 }
