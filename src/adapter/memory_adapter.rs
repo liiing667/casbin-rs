@@ -37,6 +37,7 @@ impl Adapter for MemoryAdapter {
         m: &mut dyn Model,
         f: Filter<'a>,
     ) -> Result<()> {
+        self.is_filtered = false;
         for line in self.policy.iter() {
             let sec = &line[0];
             let ptype = &line[1];

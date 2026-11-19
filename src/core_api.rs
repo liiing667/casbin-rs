@@ -93,7 +93,47 @@ pub trait CoreApi: Send + Sync {
     fn build_incremental_role_links(&mut self, d: EventData) -> Result<()>;
     async fn load_policy(&mut self) -> Result<()>;
     async fn load_filtered_policy<'a>(&mut self, f: Filter<'a>) -> Result<()>;
+    /// Loads only the policies matching `f` and associates the in-memory model
+    /// with the given filter `identity` (for example a tenant id).
+    ///
+    /// The load is transactional: when it fails, the previously loaded
+    /// policies, role links and filter identity are left untouched, so a
+    /// failed tenant switch can never produce a half-populated model or merge
+    /// two tenants together.
+    async fn load_filtered_policy_with_identity<'a, S>(
+        &mut self,
+        f: Filter<'a>,
+        identity: S,
+    ) -> Result<()>
+    where
+        S: Into<String> + Send;
+    /// Loads only the policies belonging to `tenant_id`.
+    ///
+    /// This is a thin wrapper around
+    /// [`load_filtered_policy_with_identity`](CoreApi::load_filtered_policy_with_identity)
+    /// and keeps the same transactional lifecycle guarantees.
+    async fn load_tenant_policy<'a>(
+        &mut self,
+        f: Filter<'a>,
+        tenant_id: &str,
+    ) -> Result<()> {
+        self.load_filtered_policy_with_identity(f, tenant_id.to_owned())
+            .await
+    }
     fn is_filtered(&self) -> bool;
+    /// Returns the identity (for example a tenant id) of the filter that was
+    /// used for the current filtered load, if any.
+    ///
+    /// The result is `None` after a full [`load_policy`](CoreApi::load_policy)
+    /// or before any policy has been loaded.
+    fn get_filter_identity(&self) -> Option<&str>;
+    /// Returns the tenant id of the currently loaded single-tenant policy set.
+    ///
+    /// Equivalent to [`get_filter_identity`](CoreApi::get_filter_identity)
+    /// and provided as a self-documenting alias for multi-tenant callers.
+    fn get_tenant_id(&self) -> Option<&str> {
+        self.get_filter_identity()
+    }
     fn is_enabled(&self) -> bool;
     async fn save_policy(&mut self) -> Result<()>;
     async fn clear_policy(&mut self) -> Result<()>;

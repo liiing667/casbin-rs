@@ -65,6 +65,7 @@ impl StringAdapter {
 #[async_trait]
 impl Adapter for StringAdapter {
     async fn load_policy(&mut self, m: &mut dyn Model) -> Result<()> {
+        self.is_filtered = false;
         let policies = self.policy.split("\n");
         for line in policies {
             load_policy_line(line, m);
@@ -77,7 +78,8 @@ impl Adapter for StringAdapter {
         m: &mut dyn Model,
         f: Filter<'a>,
     ) -> Result<()> {
-        self.is_filtered = false;
+        // A filtered load is scoped even when every rule matches the filter.
+        self.is_filtered = true;
         let policies = self.policy.split("\n");
         for line in policies {
             if let Some(tokens) = parse_csv_line(line) {
@@ -102,8 +104,6 @@ impl Adapter for StringAdapter {
                             ast.get_mut_policy().insert(rule);
                         }
                     }
-                } else {
-                    self.is_filtered = true;
                 }
             }
         }

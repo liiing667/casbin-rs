@@ -435,8 +435,30 @@ impl CoreApi for CachedEnforcer {
     }
 
     #[inline]
+    async fn load_filtered_policy_with_identity<'a, S>(
+        &mut self,
+        f: Filter<'a>,
+        identity: S,
+    ) -> Result<()>
+    where
+        S: Into<String> + Send,
+    {
+        let res = self
+            .enforcer
+            .load_filtered_policy_with_identity(f, identity)
+            .await;
+        self.invalidate_cache();
+        res
+    }
+
+    #[inline]
     fn is_filtered(&self) -> bool {
         self.enforcer.is_filtered()
+    }
+
+    #[inline]
+    fn get_filter_identity(&self) -> Option<&str> {
+        self.enforcer.get_filter_identity()
     }
 
     #[inline]
@@ -585,6 +607,46 @@ mod tests {
         assert!(!e.enforce(("bob", "data1", "read")).unwrap());
         e.enable_enforce(false);
         assert!(e.enforce(("bob", "data1", "read")).unwrap());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_filtered_tenant_identity_tracks_lifecycle() {
+        let m = "examples/rbac_with_domains_model.conf";
+        let p = "examples/rbac_with_domains_policy.csv";
+        let mut e = CachedEnforcer::new(m, p).await.unwrap();
+
+        let filter = Filter {
+            p: vec!["", "domain1"],
+            g: vec!["", "", "domain1"],
+        };
+        e.load_tenant_policy(filter, "domain1").await.unwrap();
+        assert!(e.is_filtered());
+        assert_eq!(e.get_tenant_id(), Some("domain1"));
+        assert!(e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+
+        let filter = Filter {
+            p: vec!["", "domain2"],
+            g: vec!["", "", "domain2"],
+        };
+        e.load_tenant_policy(filter, "domain2").await.unwrap();
+        assert_eq!(e.get_tenant_id(), Some("domain2"));
+        assert!(!e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+        assert!(e.enforce(("bob", "domain2", "data2", "read")).unwrap());
+
+        // Filtered saves stay blocked for the cached wrapper too.
+        assert!(e.save_policy().await.is_err());
+
+        e.load_policy().await.unwrap();
+        assert!(!e.is_filtered());
+        assert_eq!(e.get_tenant_id(), None);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

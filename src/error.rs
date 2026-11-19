@@ -30,6 +30,14 @@ pub enum RequestError {
 pub enum PolicyError {
     #[error("Policy doesn't match policy definition. expected length: {0}, found length {1}")]
     UnmatchPolicyDefinition(usize, usize),
+    #[error(
+        "cannot save a filtered policy to the adapter, please call load_policy() first"
+    )]
+    FilteredPolicy,
+    #[error(
+        "cannot clear the adapter while a filtered policy is loaded, please call load_policy() first"
+    )]
+    FilteredClearPolicy,
 }
 
 /// RBAC error represents any type of errors in RBAC role manager

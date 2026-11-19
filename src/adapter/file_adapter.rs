@@ -125,9 +125,13 @@ where
         m: &mut dyn Model,
         f: Filter<'a>,
     ) -> Result<()> {
-        self.is_filtered = self
-            .load_filtered_policy_file(m, f, load_filtered_policy_line)
+        // A filtered load always produces a scoped policy set, even when the
+        // filter happens to match every stored rule. Returning whether *some*
+        // rule was skipped would leave `is_filtered == false` for a
+        // fully-matching filter and allow an accidental full save afterwards.
+        self.load_filtered_policy_file(m, f, load_filtered_policy_line)
             .await?;
+        self.is_filtered = true;
 
         Ok(())
     }

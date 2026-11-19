@@ -101,6 +101,11 @@ pub struct Enforcer {
     enabled: bool,
     auto_save: bool,
     auto_build_role_links: bool,
+    // Filtered-loading lifecycle. The enforcer owns this state instead of
+    // trusting the adapter flag, which can be stale when an adapter is shared
+    // or when a filtered load fails halfway through.
+    is_filtered: bool,
+    filter_identity: Option<String>,
     #[cfg(feature = "watcher")]
     auto_notify_watcher: bool,
     #[cfg(feature = "watcher")]
@@ -587,6 +592,53 @@ impl Enforcer {
 
         Ok(())
     }
+    /// Captures every policy rule currently held by the model.
+    ///
+    /// The snapshot is keyed by `(section, ptype)` and lets us restore the
+    /// exact previous state when a filtered load fails, regardless of which
+    /// concrete [`Model`] implementation is in use.
+    fn snapshot_policy(&self) -> Vec<(String, String, Vec<Vec<String>>)> {
+        self.model
+            .get_model()
+            .iter()
+            .flat_map(|(sec, ast_map)| {
+                ast_map.iter().map(move |(ptype, ast)| {
+                    (
+                        sec.clone(),
+                        ptype.clone(),
+                        ast.get_policy().iter().cloned().collect(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Restores a policy snapshot produced by [`Self::snapshot_policy`].
+    fn restore_policy(
+        &mut self,
+        snapshot: &[(String, String, Vec<Vec<String>>)],
+    ) {
+        self.model.clear_policy();
+        for (sec, ptype, rules) in snapshot {
+            for rule in rules {
+                self.model.add_policy(sec, ptype, rule.clone());
+            }
+        }
+    }
+
+    /// Rolls the model and every role manager back to a policy snapshot after a
+    /// failed load, so a tenant switch that errors out leaves the enforcer
+    /// exactly where it was before the call.
+    fn rollback_load(
+        &mut self,
+        snapshot: &[(String, String, Vec<Vec<String>>)],
+    ) -> Result<()> {
+        self.restore_policy(snapshot);
+        if self.auto_build_role_links {
+            self.build_role_links()?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -618,6 +670,8 @@ impl CoreApi for Enforcer {
             enabled: true,
             auto_save: true,
             auto_build_role_links: true,
+            is_filtered: false,
+            filter_identity: None,
             #[cfg(feature = "watcher")]
             auto_notify_watcher: true,
             #[cfg(feature = "watcher")]
@@ -651,7 +705,11 @@ impl CoreApi for Enforcer {
         let mut e = Self::new_raw(m, a).await?;
 
         // Do not initialize the full policy when using a filtered adapter
-        if !e.adapter.is_filtered() {
+        if e.adapter.is_filtered() {
+            // Mirror the adapter's filtered state so that the enforcer keeps
+            // tracking the lifecycle even before an explicit filtered load.
+            e.is_filtered = true;
+        } else {
             e.load_policy().await?;
         }
         Ok(e)
@@ -952,34 +1010,110 @@ impl CoreApi for Enforcer {
     }
 
     async fn load_policy(&mut self) -> Result<()> {
+        let snapshot = self.snapshot_policy();
+
         self.model.clear_policy();
-        self.adapter.load_policy(&mut *self.model).await?;
+        if let Err(err) = self.adapter.load_policy(&mut *self.model).await {
+            self.rollback_load(&snapshot)?;
+            return Err(err);
+        }
         self.sort_policies();
 
         if self.auto_build_role_links {
-            self.build_role_links()?;
+            if let Err(err) = self.build_role_links() {
+                self.rollback_load(&snapshot)?;
+                return Err(err);
+            }
         }
+
+        // A successful full load replaces any previous filtered scope.
+        self.is_filtered = false;
+        self.filter_identity = None;
+
+        Ok(())
+    }
+
+    async fn load_filtered_policy_with_identity<'a, S>(
+        &mut self,
+        f: Filter<'a>,
+        identity: S,
+    ) -> Result<()>
+    where
+        S: Into<String> + Send,
+    {
+        let identity = identity.into();
+        let snapshot = self.snapshot_policy();
+        let previous_filtered = self.is_filtered;
+        let previous_identity = self.filter_identity.clone();
+
+        self.model.clear_policy();
+        if let Err(err) =
+            self.adapter.load_filtered_policy(&mut *self.model, f).await
+        {
+            self.rollback_load(&snapshot)?;
+            self.is_filtered = previous_filtered;
+            self.filter_identity = previous_identity;
+            return Err(err);
+        }
+        self.sort_policies();
+
+        if self.auto_build_role_links {
+            if let Err(err) = self.build_role_links() {
+                self.rollback_load(&snapshot)?;
+                self.is_filtered = previous_filtered;
+                self.filter_identity = previous_identity;
+                return Err(err);
+            }
+        }
+
+        // Only commit the new filtered scope once the whole load succeeded.
+        self.is_filtered = true;
+        self.filter_identity = Some(identity);
 
         Ok(())
     }
 
     async fn load_filtered_policy<'a>(&mut self, f: Filter<'a>) -> Result<()> {
+        let snapshot = self.snapshot_policy();
+        let previous_filtered = self.is_filtered;
+        let previous_identity = self.filter_identity.clone();
+
         self.model.clear_policy();
-        self.adapter
-            .load_filtered_policy(&mut *self.model, f)
-            .await?;
+        if let Err(err) =
+            self.adapter.load_filtered_policy(&mut *self.model, f).await
+        {
+            self.rollback_load(&snapshot)?;
+            self.is_filtered = previous_filtered;
+            self.filter_identity = previous_identity;
+            return Err(err);
+        }
         self.sort_policies();
 
         if self.auto_build_role_links {
-            self.build_role_links()?;
+            if let Err(err) = self.build_role_links() {
+                self.rollback_load(&snapshot)?;
+                self.is_filtered = previous_filtered;
+                self.filter_identity = previous_identity;
+                return Err(err);
+            }
         }
+
+        // Anonymous filtered load: the model is scoped, but carries no
+        // explicit tenant identity.
+        self.is_filtered = true;
+        self.filter_identity = None;
 
         Ok(())
     }
 
     #[inline]
     fn is_filtered(&self) -> bool {
-        self.adapter.is_filtered()
+        self.is_filtered
+    }
+
+    #[inline]
+    fn get_filter_identity(&self) -> Option<&str> {
+        self.filter_identity.as_deref()
     }
 
     #[inline]
@@ -988,7 +1122,9 @@ impl CoreApi for Enforcer {
     }
 
     async fn save_policy(&mut self) -> Result<()> {
-        assert!(!self.is_filtered(), "cannot save filtered policy");
+        if self.is_filtered {
+            return Err(PolicyError::FilteredPolicy.into());
+        }
 
         self.adapter.save_policy(&mut *self.model).await?;
 
@@ -1005,10 +1141,20 @@ impl CoreApi for Enforcer {
 
     #[inline]
     async fn clear_policy(&mut self) -> Result<()> {
+        // A filtered enforcer only holds a subset of the policies; forwarding
+        // the clear to the adapter would erase the unloaded tenant data too.
+        if self.auto_save && self.is_filtered {
+            return Err(PolicyError::FilteredClearPolicy.into());
+        }
         if self.auto_save {
             self.adapter.clear_policy().await?;
         }
         self.model.clear_policy();
+        for rm in self.rm_map.values() {
+            rm.write().clear();
+        }
+        self.is_filtered = false;
+        self.filter_identity = None;
 
         #[cfg(any(feature = "logging", feature = "watcher"))]
         self.emit(Event::PolicyChange, EventData::ClearPolicy);
@@ -2282,5 +2428,297 @@ m = r.sub == p.sub && r.act == p.act && isOwner(r.sub, r.obj)
             .unwrap()
             .insert(("alice".to_owned(), "doc2".to_owned()));
         assert!(e.enforce(("alice", "doc2", "read")).unwrap());
+    }
+
+    const DOMAINS_MODEL: &str = r#"
+[request_definition]
+r = sub, dom, obj, act
+
+[policy_definition]
+p = sub, dom, obj, act
+
+[role_definition]
+g = _, _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj && r.act == p.act
+"#;
+
+    const DOMAINS_POLICY: &str = "\
+p, admin, domain1, data1, read
+p, admin, domain1, data1, write
+p, admin, domain2, data2, read
+p, admin, domain2, data2, write
+g, alice, admin, domain1
+g, bob, admin, domain2";
+
+    fn domain_filter<'a>(domain: &'a str) -> Filter<'a> {
+        Filter {
+            p: vec!["", domain],
+            g: vec!["", "", domain],
+        }
+    }
+
+    // An adapter whose filtered load always fails. Used to prove that a failed
+    // tenant switch never leaves a half-loaded model behind.
+    struct FailingAdapter {
+        inner: MemoryAdapter,
+    }
+
+    #[async_trait]
+    impl Adapter for FailingAdapter {
+        async fn load_policy(&mut self, m: &mut dyn Model) -> Result<()> {
+            self.inner.load_policy(m).await
+        }
+
+        async fn load_filtered_policy<'a>(
+            &mut self,
+            _m: &mut dyn Model,
+            _f: Filter<'a>,
+        ) -> Result<()> {
+            Err(std::io::Error::other("simulated filtered load failure").into())
+        }
+
+        async fn save_policy(&mut self, m: &mut dyn Model) -> Result<()> {
+            self.inner.save_policy(m).await
+        }
+
+        async fn clear_policy(&mut self) -> Result<()> {
+            self.inner.clear_policy().await
+        }
+
+        fn is_filtered(&self) -> bool {
+            self.inner.is_filtered()
+        }
+
+        async fn add_policy(
+            &mut self,
+            sec: &str,
+            ptype: &str,
+            rule: Vec<String>,
+        ) -> Result<bool> {
+            self.inner.add_policy(sec, ptype, rule).await
+        }
+
+        async fn add_policies(
+            &mut self,
+            sec: &str,
+            ptype: &str,
+            rules: Vec<Vec<String>>,
+        ) -> Result<bool> {
+            self.inner.add_policies(sec, ptype, rules).await
+        }
+
+        async fn remove_policy(
+            &mut self,
+            sec: &str,
+            ptype: &str,
+            rule: Vec<String>,
+        ) -> Result<bool> {
+            self.inner.remove_policy(sec, ptype, rule).await
+        }
+
+        async fn remove_policies(
+            &mut self,
+            sec: &str,
+            ptype: &str,
+            rules: Vec<Vec<String>>,
+        ) -> Result<bool> {
+            self.inner.remove_policies(sec, ptype, rules).await
+        }
+
+        async fn remove_filtered_policy(
+            &mut self,
+            sec: &str,
+            ptype: &str,
+            field_index: usize,
+            field_values: Vec<String>,
+        ) -> Result<bool> {
+            self.inner
+                .remove_filtered_policy(sec, ptype, field_index, field_values)
+                .await
+        }
+    }
+
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn test_filtered_tenant_switch_does_not_leak_roles_or_policies() {
+        let model = DefaultModel::from_str(DOMAINS_MODEL).await.unwrap();
+        let adapter = StringAdapter::new(DOMAINS_POLICY);
+        let mut e = Enforcer::new(model, adapter).await.unwrap();
+
+        assert!(!e.is_filtered());
+        assert_eq!(e.get_tenant_id(), None);
+
+        e.load_tenant_policy(domain_filter("domain1"), "domain1")
+            .await
+            .unwrap();
+
+        assert!(e.is_filtered());
+        assert_eq!(e.get_tenant_id(), Some("domain1"));
+        assert_eq!(e.get_filter_identity(), Some("domain1"));
+        assert!(e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+        // domain2 was never loaded: its policies and bob's role link are gone.
+        assert!(!e.enforce(("bob", "domain2", "data2", "read")).unwrap());
+        assert!(!e.enforce(("alice", "domain2", "data2", "read")).unwrap());
+
+        // Switching tenants must replace, not merge, the previous scope.
+        e.load_tenant_policy(domain_filter("domain2"), "domain2")
+            .await
+            .unwrap();
+
+        assert_eq!(e.get_tenant_id(), Some("domain2"));
+        assert!(e.enforce(("bob", "domain2", "data2", "read")).unwrap());
+        assert!(!e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+
+        // Reloading the same tenant keeps working.
+        e.load_tenant_policy(domain_filter("domain2"), "domain2")
+            .await
+            .unwrap();
+        assert!(e.enforce(("bob", "domain2", "data2", "read")).unwrap());
+
+        // A full load exits the filtered lifecycle and restores everything.
+        e.load_policy().await.unwrap();
+        assert!(!e.is_filtered());
+        assert_eq!(e.get_tenant_id(), None);
+        assert!(e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+        assert!(e.enforce(("bob", "domain2", "data2", "read")).unwrap());
+        e.save_policy().await.unwrap();
+    }
+
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn test_anonymous_filtered_load_has_no_identity() {
+        let model = DefaultModel::from_str(DOMAINS_MODEL).await.unwrap();
+        let adapter = StringAdapter::new(DOMAINS_POLICY);
+        let mut e = Enforcer::new(model, adapter).await.unwrap();
+
+        e.load_filtered_policy(domain_filter("domain1"))
+            .await
+            .unwrap();
+
+        assert!(e.is_filtered());
+        assert_eq!(e.get_filter_identity(), None);
+        assert_eq!(e.get_tenant_id(), None);
+        assert!(e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+    }
+
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn test_save_and_clear_rejected_while_filtered() {
+        let model = DefaultModel::from_str(DOMAINS_MODEL).await.unwrap();
+        let adapter = StringAdapter::new(DOMAINS_POLICY);
+        let mut e = Enforcer::new(model, adapter).await.unwrap();
+
+        e.load_tenant_policy(domain_filter("domain1"), "domain1")
+            .await
+            .unwrap();
+
+        // Saving a partial set would overwrite the adapter with only one
+        // tenant: it must fail instead of silently truncating the store.
+        let err = e.save_policy().await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::PolicyError(PolicyError::FilteredPolicy)
+        ));
+
+        // With auto-save on, clearing would erase unloaded tenants too.
+        let err = e.clear_policy().await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::PolicyError(PolicyError::FilteredClearPolicy)
+        ));
+
+        // The rejected operations must not have mutated the loaded scope.
+        assert_eq!(e.get_tenant_id(), Some("domain1"));
+        assert!(e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+
+        // After going back to a full load, saving is allowed again.
+        e.load_policy().await.unwrap();
+        e.save_policy().await.unwrap();
+    }
+
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn test_failed_filtered_load_rolls_back_to_previous_tenant() {
+        // First enforcer establishes a healthy domain1 scope backed by real
+        // policies. The failing adapter then takes over without any reload.
+        let model = DefaultModel::from_str(DOMAINS_MODEL).await.unwrap();
+        let mut e = Enforcer::new(model, StringAdapter::new(DOMAINS_POLICY))
+            .await
+            .unwrap();
+        e.load_tenant_policy(domain_filter("domain1"), "domain1")
+            .await
+            .unwrap();
+        e.adapter = Box::new(FailingAdapter {
+            inner: MemoryAdapter::default(),
+        });
+
+        let err = e
+            .load_tenant_policy(domain_filter("domain2"), "domain2")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated filtered load failure"));
+
+        // Identity, policies and role links all stay on the previous tenant.
+        assert!(e.is_filtered());
+        assert_eq!(e.get_tenant_id(), Some("domain1"));
+        assert!(e.enforce(("alice", "domain1", "data1", "read")).unwrap());
+        assert!(!e.enforce(("bob", "domain2", "data2", "read")).unwrap());
+    }
+
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    async fn test_full_load_resets_adapter_filtered_flag() {
+        let model = DefaultModel::from_str(DOMAINS_MODEL).await.unwrap();
+        let adapter = StringAdapter::new(DOMAINS_POLICY);
+        let mut e = Enforcer::new(model, adapter).await.unwrap();
+        e.load_filtered_policy(domain_filter("domain1"))
+            .await
+            .unwrap();
+        assert!(e.get_adapter().is_filtered());
+
+        // A subsequent full load must clear the adapter's sticky filtered flag.
+        e.load_policy().await.unwrap();
+        assert!(!e.get_adapter().is_filtered());
+        assert!(!e.is_filtered());
     }
 }
