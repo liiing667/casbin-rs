@@ -17,7 +17,7 @@ use crate::{
 use crate::emitter::notify_logger_and_watcher;
 
 #[cfg(feature = "watcher")]
-use crate::watcher::Watcher;
+use crate::watcher::{PolicyBarrier, Watcher};
 
 #[cfg(feature = "logging")]
 use crate::logger::Logger;
@@ -53,6 +53,11 @@ impl EventEmitter<Event> for CachedEnforcer {
             for cb in cbs.clone().iter() {
                 cb(self, d.clone())
             }
+        }
+
+        #[cfg(feature = "watcher")]
+        if e == Event::PolicyChange {
+            self.enforcer.barrier().reconcile();
         }
     }
 }
@@ -106,6 +111,13 @@ fn write_value(key: &mut String, value: &Dynamic) -> Option<()> {
 }
 
 impl CachedEnforcer {
+    /// Returns the barrier that orders watcher-delivered policy events
+    /// against local enforcement. See [`Enforcer::policy_barrier`].
+    #[cfg(feature = "watcher")]
+    pub fn policy_barrier(&self) -> PolicyBarrier {
+        self.enforcer.policy_barrier()
+    }
+
     #[inline]
     fn invalidate_cache(&self) {
         self.cache.clear();
@@ -142,6 +154,14 @@ impl CachedEnforcer {
             return Ok((authorized, false, indices));
         }
 
+        // Unreconciled watcher events fail closed without consulting or
+        // populating the cache, so a stale allow can never be served and
+        // a fail-closed deny is never cached.
+        #[cfg(feature = "watcher")]
+        if self.enforcer.barrier().is_stale() {
+            return Ok((false, false, None));
+        }
+
         self.cached_enforce(cache_key("", rvals), || {
             self.enforcer.private_enforce(rvals)
         })
@@ -156,6 +176,11 @@ impl CachedEnforcer {
             let (authorized, indices) =
                 self.enforcer.private_enforce_with_context(ctx, rvals)?;
             return Ok((authorized, false, indices));
+        }
+
+        #[cfg(feature = "watcher")]
+        if self.enforcer.barrier().is_stale() {
+            return Ok((false, false, None));
         }
 
         self.cached_enforce(cache_key(&ctx.get_cache_key(), rvals), || {

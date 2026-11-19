@@ -20,7 +20,7 @@ use crate::model::DefaultModel;
 use crate::emitter::notify_logger_and_watcher;
 
 #[cfg(feature = "watcher")]
-use crate::watcher::Watcher;
+use crate::watcher::{PolicyBarrier, Watcher};
 
 #[cfg(feature = "logging")]
 use crate::{DefaultLogger, Logger};
@@ -105,6 +105,8 @@ pub struct Enforcer {
     auto_notify_watcher: bool,
     #[cfg(feature = "watcher")]
     watcher: Option<Box<dyn Watcher>>,
+    #[cfg(feature = "watcher")]
+    barrier: PolicyBarrier,
     events: HashMap<Event, Vec<EventCallback>>,
     engine: Engine,
     #[cfg(feature = "logging")]
@@ -150,16 +152,48 @@ impl EventEmitter<Event> for Enforcer {
                 cb(self, d.clone())
             }
         }
+
+        // A locally applied change is already reflected in the model, role
+        // graph and cache, so publishing it (including the watcher's echo)
+        // cannot leave the barrier stale.
+        #[cfg(feature = "watcher")]
+        if e == Event::PolicyChange {
+            self.barrier.reconcile();
+        }
     }
 }
 
 impl Enforcer {
+    /// Returns the barrier that orders watcher-delivered policy events
+    /// against local enforcement.
+    ///
+    /// While the barrier is not reconciled, enforcement fails closed.
+    /// Custom watcher callbacks installed via `set_update_callback` should
+    /// call [`PolicyBarrier::publish`] on every external policy-change
+    /// event to preserve that guarantee.
+    #[cfg(feature = "watcher")]
+    pub fn policy_barrier(&self) -> PolicyBarrier {
+        self.barrier.clone()
+    }
+
+    #[cfg(all(feature = "watcher", feature = "cached"))]
+    pub(crate) fn barrier(&self) -> &PolicyBarrier {
+        &self.barrier
+    }
+
     pub(crate) fn private_enforce(
         &self,
         rvals: &[Dynamic],
     ) -> Result<(bool, Option<Vec<usize>>)> {
         if !self.enabled {
             return Ok((true, None));
+        }
+
+        // External policy events that are not reconciled yet must fail
+        // closed rather than serve a stale allow.
+        #[cfg(feature = "watcher")]
+        if self.barrier.is_stale() {
+            return Ok((false, None));
         }
 
         let mut scope: Scope = Scope::new();
@@ -280,6 +314,11 @@ impl Enforcer {
     ) -> Result<(bool, Option<Vec<usize>>)> {
         if !self.enabled {
             return Ok((true, None));
+        }
+
+        #[cfg(feature = "watcher")]
+        if self.barrier.is_stale() {
+            return Ok((false, None));
         }
 
         let mut scope: Scope = Scope::new();
@@ -622,6 +661,8 @@ impl CoreApi for Enforcer {
             auto_notify_watcher: true,
             #[cfg(feature = "watcher")]
             watcher: None,
+            #[cfg(feature = "watcher")]
+            barrier: PolicyBarrier::default(),
             events: HashMap::new(),
             engine,
             #[cfg(feature = "logging")]
@@ -686,6 +727,11 @@ impl CoreApi for Enforcer {
     #[cfg(feature = "watcher")]
     #[inline]
     fn set_watcher(&mut self, w: Box<dyn Watcher>) {
+        let mut w = w;
+        let barrier = self.barrier.clone();
+        w.set_update_callback(Box::new(move |_: String| {
+            barrier.publish();
+        }));
         self.watcher = Some(w);
     }
 
@@ -960,6 +1006,12 @@ impl CoreApi for Enforcer {
             self.build_role_links()?;
         }
 
+        // Model and role graph now reflect the store; every published
+        // watcher event up to this point is reconciled. On failure above
+        // the barrier stays stale and enforcement keeps failing closed.
+        #[cfg(feature = "watcher")]
+        self.barrier.reconcile();
+
         Ok(())
     }
 
@@ -973,6 +1025,9 @@ impl CoreApi for Enforcer {
         if self.auto_build_role_links {
             self.build_role_links()?;
         }
+
+        #[cfg(feature = "watcher")]
+        self.barrier.reconcile();
 
         Ok(())
     }

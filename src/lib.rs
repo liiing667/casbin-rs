@@ -59,7 +59,7 @@ pub use model::{function_map, Assertion, DefaultModel, Model};
 pub use rbac::{DefaultRoleManager, MatchingFn, RoleManager};
 pub use rbac_api::RbacApi;
 #[cfg(feature = "watcher")]
-pub use watcher::Watcher;
+pub use watcher::{PolicyBarrier, Watcher};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

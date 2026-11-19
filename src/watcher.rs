@@ -1,8 +1,69 @@
 use crate::emitter::EventData;
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 pub trait Watcher: Send + Sync {
     fn set_update_callback(&mut self, cb: Box<dyn FnMut(String) + Send + Sync>);
     fn update(&mut self, d: EventData);
+}
+
+/// A publication barrier that orders external policy-change events
+/// delivered through a [`Watcher`] against local enforcement.
+///
+/// When the watcher callback fires, [`PolicyBarrier::publish`] records the
+/// event synchronously, before the callback returns. From that moment on,
+/// and until the enforcer has reconciled its model, role graph and cache
+/// (through `load_policy`, `load_filtered_policy` or a local policy
+/// mutation), [`PolicyBarrier::is_reconciled`] returns `false` and the
+/// enforcer fails closed: `enforce` denies rather than risking a stale
+/// `allow`.
+///
+/// `Enforcer::set_watcher` wires this barrier into the watcher's update
+/// callback automatically. Code that replaces the callback with
+/// `set_update_callback` should obtain the barrier via
+/// `Enforcer::policy_barrier` (or `CachedEnforcer::policy_barrier`) and
+/// call [`PolicyBarrier::publish`] for every external policy-change event
+/// to keep the fail-closed guarantee.
+#[derive(Clone, Debug, Default)]
+pub struct PolicyBarrier {
+    inner: Arc<BarrierState>,
+}
+
+#[derive(Debug, Default)]
+struct BarrierState {
+    /// External events published by the watcher callback.
+    published: AtomicU64,
+    /// Events already reflected in the local model, role graph and cache.
+    applied: AtomicU64,
+}
+
+impl PolicyBarrier {
+    /// Record an external policy-change event. The publication is
+    /// synchronously visible to subsequent enforcement on any thread.
+    pub fn publish(&self) {
+        self.inner.published.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Mark every event published so far as reflected in the local model,
+    /// role graph and cache.
+    pub(crate) fn reconcile(&self) {
+        let published = self.inner.published.load(Ordering::SeqCst);
+        self.inner.applied.fetch_max(published, Ordering::SeqCst);
+    }
+
+    /// `true` when every published event is reflected locally. While this
+    /// returns `false`, enforcement fails closed.
+    pub fn is_reconciled(&self) -> bool {
+        self.inner.applied.load(Ordering::SeqCst)
+            >= self.inner.published.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_stale(&self) -> bool {
+        !self.is_reconciled()
+    }
 }
 
 #[cfg(test)]
@@ -174,6 +235,220 @@ mod tests {
         assert!(result.contains("alice"));
         assert!(result.contains("data1"));
         assert!(result.contains("read"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn temp_policy_path(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "casbin_rs_{}_{}.csv",
+            name,
+            std::process::id()
+        ));
+        std::fs::copy("examples/rbac_policy.csv", &path).unwrap();
+        path
+    }
+
+    // An external revocation published through the watcher must be visible
+    // to the very next request: the enforcer fails closed until its model,
+    // role graph and cache are reconciled with the store.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_external_revocation_fails_closed_until_reconciled() {
+        let path = temp_policy_path("external_revocation");
+
+        let mut e = Enforcer::new(
+            "examples/rbac_model.conf",
+            FileAdapter::new(path.clone()),
+        )
+        .await
+        .unwrap();
+        e.set_watcher(Box::new(SampleWatcher::new()));
+
+        // alice inherits data2 read through g, alice, data2_admin.
+        assert!(e.enforce(("alice", "data2", "read")).unwrap());
+
+        // Another instance revokes the role and the watcher delivers the
+        // event.
+        std::fs::write(
+            &path,
+            "p, alice, data1, read\n\
+             p, bob, data2, write\n\
+             p, data2_admin, data2, read\n\
+             p, data2_admin, data2, write\n",
+        )
+        .unwrap();
+        if let Some(watcher) = e.get_mut_watcher() {
+            watcher.update(EventData::RemovePolicy(
+                "g".to_owned(),
+                "g".to_owned(),
+                vec!["alice".to_owned(), "data2_admin".to_owned()],
+            ));
+        }
+
+        // The publication is visible right away and the first request
+        // after propagation fails closed instead of serving the stale
+        // allow.
+        assert!(!e.policy_barrier().is_reconciled());
+        assert!(!e.enforce(("alice", "data2", "read")).unwrap());
+
+        // Reloading reconciles model, role graph and barrier: the
+        // revocation is now reflected and unchanged policies still allow.
+        e.load_policy().await.unwrap();
+        assert!(e.policy_barrier().is_reconciled());
+        assert!(!e.enforce(("alice", "data2", "read")).unwrap());
+        assert!(e.enforce(("alice", "data1", "read")).unwrap());
+    }
+
+    // When reconciling fails, the enforcer must keep failing closed rather
+    // than fall back to the stale in-memory policy.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_failed_reconcile_keeps_failing_closed() {
+        let path = temp_policy_path("failed_reconcile");
+
+        let mut e = Enforcer::new(
+            "examples/rbac_model.conf",
+            FileAdapter::new(path.clone()),
+        )
+        .await
+        .unwrap();
+        e.set_watcher(Box::new(SampleWatcher::new()));
+        assert!(e.enforce(("alice", "data1", "read")).unwrap());
+
+        if let Some(watcher) = e.get_mut_watcher() {
+            watcher.update(EventData::ClearPolicy);
+        }
+        assert!(!e.policy_barrier().is_reconciled());
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(e.load_policy().await.is_err());
+        assert!(!e.policy_barrier().is_reconciled());
+        assert!(!e.enforce(("alice", "data1", "read")).unwrap());
+    }
+
+    // A local policy change is echoed back through the watcher callback,
+    // but it is already applied to the local model, role graph and cache,
+    // so enforcement must not start failing closed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_local_policy_change_stays_reconciled() {
+        let mut e = Enforcer::new(
+            "examples/rbac_model.conf",
+            temp_policy_file("local_change"),
+        )
+        .await
+        .unwrap();
+        e.set_watcher(Box::new(SampleWatcher::new()));
+
+        e.add_policy(vec![
+            "eva".to_owned(),
+            "data9".to_owned(),
+            "read".to_owned(),
+        ])
+        .await
+        .unwrap();
+
+        assert!(e.policy_barrier().is_reconciled());
+        assert!(e.enforce(("eva", "data9", "read")).unwrap());
+    }
+
+    // The reported production bug: a cached allow must not survive an
+    // external revocation delivered through the watcher.
+    #[cfg(all(feature = "cached", not(target_arch = "wasm32")))]
+    #[cfg_attr(
+        all(feature = "runtime-async-std", not(target_arch = "wasm32")),
+        async_std::test
+    )]
+    #[cfg_attr(
+        all(feature = "runtime-tokio", not(target_arch = "wasm32")),
+        tokio::test
+    )]
+    async fn test_cached_enforcer_stops_serving_stale_allow() {
+        let path = temp_policy_path("cached_stale_allow");
+
+        let mut e = CachedEnforcer::new(
+            "examples/rbac_model.conf",
+            FileAdapter::new(path.clone()),
+        )
+        .await
+        .unwrap();
+        e.set_watcher(Box::new(SampleWatcher::new()));
+
+        let request: [crate::rhai::Dynamic; 3] =
+            ["alice".into(), "data2".into(), "read".into()];
+
+        // Prime the cache with a role-based allow.
+        let (allowed, cached, _) = e.private_enforce(&request).unwrap();
+        assert!(allowed);
+        assert!(!cached);
+
+        // Steady state: the same request is served from the cache.
+        let (allowed, cached, _) = e.private_enforce(&request).unwrap();
+        assert!(allowed);
+        assert!(cached);
+
+        // Another instance revokes the role; the watcher delivers the
+        // event.
+        std::fs::write(
+            &path,
+            "p, alice, data1, read\n\
+             p, bob, data2, write\n\
+             p, data2_admin, data2, read\n\
+             p, data2_admin, data2, write\n",
+        )
+        .unwrap();
+        if let Some(watcher) = e.get_mut_watcher() {
+            watcher.update(EventData::RemovePolicy(
+                "g".to_owned(),
+                "g".to_owned(),
+                vec!["alice".to_owned(), "data2_admin".to_owned()],
+            ));
+        }
+
+        // The first request after propagation must not hit the stale
+        // allow, and the fail-closed deny must not be cached either.
+        let (allowed, cached, _) = e.private_enforce(&request).unwrap();
+        assert!(!allowed);
+        assert!(!cached);
+
+        // Reconcile: the revocation is reflected and caching resumes for
+        // the fresh policy.
+        e.load_policy().await.unwrap();
+        assert!(e.policy_barrier().is_reconciled());
+
+        let (allowed, cached, _) = e.private_enforce(&request).unwrap();
+        assert!(!allowed);
+        assert!(!cached);
+        let (allowed, cached, _) = e.private_enforce(&request).unwrap();
+        assert!(!allowed);
+        assert!(cached);
+
+        // Unchanged policies still allow.
+        let (allowed, _, _) = e
+            .private_enforce(&["alice".into(), "data1".into(), "read".into()])
+            .unwrap();
+        assert!(allowed);
     }
 
     // Sample extended watcher implementation for comprehensive testing

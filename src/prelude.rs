@@ -11,4 +11,4 @@ pub use crate::FileAdapter;
 pub use crate::{CachedApi, CachedEnforcer};
 
 #[cfg(feature = "watcher")]
-pub use crate::Watcher;
+pub use crate::{PolicyBarrier, Watcher};
